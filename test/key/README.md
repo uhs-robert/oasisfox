@@ -1,6 +1,6 @@
 # test/key
 
-Key tests. Each run builds the extension, starts Firefox in its own nested, invisible session, sends real key presses and checks what the page and the background report. `run.mjs` holds the cases, `server.mjs` and `rdp.mjs` read the results, `launch_firefox.sh` starts Firefox, and `user.js` and `config/` set up the test profile.
+Key tests. Each run builds the extension, starts Firefox in its own nested, invisible session, sends real key presses and checks what the page and the background report. `run.mjs` holds the cases, `timings.mjs` measures where the time goes, `server.mjs` and `rdp.mjs` read the results, `launch_firefox.sh` starts Firefox, and `user.js` and `config/` set up the test profile.
 
 ## Run
 
@@ -16,6 +16,16 @@ It takes about a minute and needs a nested Hyprland.
   Cleanup of killed runs works only for drivers that keep a session's runtime dir in `/tmp/shadow-<uid>-<name>`.
   When `SHADOW_SH` is unset, the recipe uses `$HOME/dotfiles/.claude/skills/shadow/shadow.sh` if it is executable. With neither, it exits.
 - Each run starts its own shadow session, so runs from different worktrees go in parallel with no lock.
+
+## Timings
+
+Every run times itself and prints a summary at the end: time by category, time outside cases, the 20 slowest cases and the open tab count. It also writes the full numbers as JSON.
+
+- The file is `.logs/key-test-timings-<timestamp>.json` in the checkout. `KEY_TEST_TIMINGS_FILE=<path>` sets another path.
+- Each moment of the run goes to one category: `keys` (a `shadow keys` call), `settle` (the pause after each key call), `sleeps` (other sleeps), `waits` (`wait_event`), `rdp` (debugger calls), `page_opens` (all of `open_page`, keys and waits inside it included), `driver` (`up`, `spawn`, `shot`) and `other` (everything untracked, such as test logic).
+- The JSON holds `categories` and `outside_cases` (ms and call counts), `pieces` (wall time per piece file), `cases` (wall time and categories per case) and `tab_samples` (open tab count before and after each piece). Setup between cases counts as `(outside cases)`.
+- The file is rewritten after each piece and when SIGINT or SIGTERM arrives, so a run killed at the time cap still leaves its numbers (the summary prints only at a normal end or on a signal).
+- Piece files need no hooks: they get the timed `sleep`, `open_page`, `wait_event` and `rdp` from the case context.
 
 ## Native host
 

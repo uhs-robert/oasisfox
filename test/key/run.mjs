@@ -12,6 +12,7 @@ import { promisify } from "node:util";
 import { connect_rdp, evaluate_in_background, evaluate_in_chrome, install_temporary_addon } from "./rdp.mjs";
 import { p1_cases } from "./p1.mjs";
 import { start_server } from "./server.mjs";
+import { create_timings, default_timings_path } from "./timings.mjs";
 
 const run_execfile = promisify(execFile);
 const key_test_dir = dirname(fileURLToPath(import.meta.url));
@@ -30,13 +31,16 @@ if (!shadow_sh) {
   process.exit(2);
 }
 
-const sleep = (ms) => new Promise((resolve_sleep) => setTimeout(resolve_sleep, ms));
+const timings = create_timings();
+const raw_sleep = (ms) => new Promise((resolve_sleep) => setTimeout(resolve_sleep, ms));
+const sleep = (ms) => timings.time("sleeps", () => raw_sleep(ms));
 const shadow = (...args) => run_execfile(shadow_sh, args, { maxBuffer: 1 << 24 });
+const timed_shadow = (...args) => timings.time("driver", () => shadow(...args));
 // The pause lets a switched-to tab take keyboard focus before the next press.
 const KEY_SETTLE_MS = 350;
 async function send_keys(...wtype_args) {
-  await shadow("keys", SHADOW_NAME, ...wtype_args);
-  await sleep(KEY_SETTLE_MS);
+  await timings.time("keys", () => shadow("keys", SHADOW_NAME, ...wtype_args));
+  await timings.time("settle", () => raw_sleep(KEY_SETTLE_MS));
 }
 
 const ALT = (key) => ["-M", "alt", key, "-m", "alt"];
@@ -133,14 +137,16 @@ async function run_case(name, body, { setup = false } = {}) {
   const selected = !process.env.KEY_TEST_ONLY || new RegExp(process.env.KEY_TEST_ONLY).test(name);
   if (!selected && !setup) return;
   const label = selected ? "" : "SETUP ";
-  try {
-    await body();
-    results.push({ name, pass: true, setup: !selected });
-    console.log(`${label}PASS ${name}`);
-  } catch (error) {
-    results.push({ name, pass: false, reason: error.message, setup: !selected });
-    console.log(`${label}FAIL ${name}: ${error.message}`);
-  }
+  await timings.time_case(name, { setup: !selected }, async () => {
+    try {
+      await body();
+      results.push({ name, pass: true, setup: !selected });
+      console.log(`${label}PASS ${name}`);
+    } catch (error) {
+      results.push({ name, pass: false, reason: error.message, setup: !selected });
+      console.log(`${label}FAIL ${name}: ${error.message}`);
+    }
+  });
 }
 
 function expect(condition, message) {
@@ -196,19 +202,25 @@ async function main() {
     return teardown_started;
   };
   for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]]) {
-    process.on(signal, () => teardown().finally(() => process.exit(code)));
+    process.on(signal, () => {
+      // Written before the teardown, so a hung teardown loses nothing and is not charged to the case.
+      timings.finish_active_case();
+      write_timings();
+      teardown().finally(() => process.exit(code));
+    });
   }
 
   const url_of = (kind, id) => `http://127.0.0.1:${server.port}/${kind}?id=${id}`;
   const since = (mark) => events.slice(mark);
   const find_event = (mark, predicate) => since(mark).find(predicate);
-  async function wait_event(mark, predicate, what, timeout_ms = 8000) {
+  const wait_event = (...args) => timings.time("waits", () => wait_event_untimed(...args));
+  async function wait_event_untimed(mark, predicate, what, timeout_ms = 8000) {
     const deadline = Date.now() + timeout_ms;
     for (;;) {
       const found = find_event(mark, predicate);
       if (found) return found;
       if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
-      await sleep(50);
+      await raw_sleep(50);
     }
   }
   const became_visible = (page_id) => (event) => event.type === "visibility" && event.state === "visible" && event.page_id === page_id;
@@ -216,7 +228,8 @@ async function main() {
   const scroll_of = (page_id) => (event) => event.type === "scroll" && event.page_id === page_id;
   const last_scroll_y = (page_id) => events.filter(scroll_of(page_id)).at(-1)?.y ?? 0;
 
-  async function open_page(kind, id, { new_tab }) {
+  const open_page = (...args) => timings.time("page_opens", () => open_page_untimed(...args));
+  async function open_page_untimed(kind, id, { new_tab }) {
     const mark = events.length;
     if (new_tab) {
       await send_keys(...CTRL("t"));
@@ -258,16 +271,36 @@ async function main() {
     expect(visible.length <= 1, `expected one switch to ${expected_page_id}, saw [${visible.map((event) => event.page_id).join(", ")}]`);
   }
 
+  const timings_path = default_timings_path(repo_dir);
+  // Called after each piece, from the signal path and at the end, so a run killed at the time cap still leaves its numbers. A failed write must not hide the run's own error.
+  function write_timings({ print_summary = true } = {}) {
+    try {
+      const timings_report = timings.report();
+      timings.write_json(timings_path, timings_report);
+      if (!print_summary) return;
+      console.log(timings.summary_text(timings_report));
+      console.log(`key-test timings written to ${timings_path}`);
+    } catch (error) {
+      console.error(`key-test timings not written: ${error.message}`);
+    }
+  }
+
+  // Piled-up tabs may slow later steps, so the count is sampled between pieces. A failed sample is recorded as null.
+  async function sample_tabs(label) {
+    const tab_count = await evaluate_in_background(rdp, EXTENSION_ID, `browser.tabs.query({}).then((tabs) => tabs.length)`).catch(() => null);
+    timings.record_tab_count(label, tab_count);
+  }
+
   try {
     await sweep_dead_sessions();
-    await shadow("up", SHADOW_NAME);
+    await timed_shadow("up", SHADOW_NAME);
     // A driver that keeps sessions elsewhere has no such dir. Its sessions are never swept, which is safe.
     if (existsSync(dirname(marker_path(SHADOW_NAME)))) writeFileSync(marker_path(SHADOW_NAME), String(process.pid));
     else console.error(`no runtime dir for ${SHADOW_NAME} under /tmp: skipping the owner marker, so a killed run's session will not be swept`);
-    await shadow("spawn", SHADOW_NAME, join(key_test_dir, "launch_firefox.sh"), work_dir, profile_dir, String(debug_port), managed_file);
+    await timed_shadow("spawn", SHADOW_NAME, join(key_test_dir, "launch_firefox.sh"), work_dir, profile_dir, String(debug_port), managed_file);
     for (let attempt = 0; ; attempt++) {
       try {
-        rdp = await connect_rdp(debug_port);
+        rdp = timings.wrap_rdp(await connect_rdp(debug_port));
         break;
       } catch (error) {
         if (attempt > 60) throw new Error(`Firefox debugger never answered: ${error.message}`);
@@ -845,8 +878,16 @@ async function main() {
     };
 
     // Pieces keep their cases in test/key/p<number>_*.mjs, each exporting run_cases(context).
-    const case_context = { config_dir, load_config_dir, take_shot: (path) => shadow("shot", SHADOW_NAME, "--out", path), run_case, expect, open_page, send_keys, sleep, events, wait_event, since, find_event, url_of, rdp, extension_id: EXTENSION_ID, scroll_delta_after, became_visible, scroll_of, last_scroll_y };
-    for (const file of readdirSync(key_test_dir).filter((name) => /^p\d+_.*\.mjs$/.test(name)).sort()) await (await import(`./${file}`)).run_cases(case_context);
+    const case_context = { config_dir, load_config_dir, take_shot: (path) => timed_shadow("shot", SHADOW_NAME, "--out", path), run_case, expect, open_page, send_keys, sleep, events, wait_event, since, find_event, url_of, rdp, extension_id: EXTENSION_ID, scroll_delta_after, became_visible, scroll_of, last_scroll_y };
+    await sample_tabs("before pieces");
+    for (const file of readdirSync(key_test_dir).filter((name) => /^p\d+_.*\.mjs$/.test(name)).sort()) {
+      await timings.time_piece(file, async () => {
+        await sample_tabs(`before ${file}`);
+        await (await import(`./${file}`)).run_cases(case_context);
+      });
+      write_timings({ print_summary: false });
+    }
+    await sample_tabs("after pieces");
 
     const tree_read_ms = [];
     for (let index = 0; index < FRESH_LOAD_COUNT; index++) {
@@ -859,10 +900,12 @@ async function main() {
     const sorted = [...tree_read_ms].sort((left, right) => left - right);
     measurements.tree_read_summary = { loads: sorted.length, min: sorted[0], median: (sorted[(sorted.length - 1) >> 1] + sorted[sorted.length >> 1]) / 2, max: sorted.at(-1) };
 
-    await p1_cases({ run_case, expect, send_keys, sleep, open_page, events, wait_event, scroll_of, last_scroll_y, find_event, evaluate_in_background, rdp, EXTENSION_ID });
+    await timings.time_piece("p1.mjs", () => p1_cases({ run_case, expect, send_keys, sleep, open_page, events, wait_event, scroll_of, last_scroll_y, find_event, evaluate_in_background, rdp, EXTENSION_ID }));
+    await sample_tabs("after p1.mjs");
   } finally {
     await teardown();
     console.log(JSON.stringify(measurements));
+    write_timings();
   }
 
   const failed = results.filter((result) => !result.pass);
